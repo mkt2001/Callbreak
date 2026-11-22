@@ -1,0 +1,95 @@
+name: Build Android APK and publish Release
+
+# Works in two ways:
+#  1) You uploaded the extracted project (mobile/, backend/, ... in the repo root), OR
+#  2) You uploaded only the .zip file to the repo root - this workflow unzips it by itself.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project (auto-unzip if needed)
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          if [ -f mobile/package.json ]; then
+            ROOT="$PWD"
+          else
+            ZIP=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+            if [ -z "$ZIP" ]; then echo "::error::No project found. Upload callbreak-premium.zip to the repository root."; exit 1; fi
+            echo "Unzipping $ZIP"
+            mkdir -p _unzipped && unzip -q -o "$ZIP" -d _unzipped
+            P=$(find _unzipped -type f -path '*/mobile/package.json' -not -path '*/node_modules/*' | head -n1)
+            if [ -z "$P" ]; then echo "::error::mobile/package.json not found inside the zip"; exit 1; fi
+            ROOT=$(cd "$(dirname "$P")/.." && pwd)
+          fi
+          echo "Project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Sync shared game rules into the app
+        run: |
+          cd "${{ steps.locate.outputs.root }}"
+          [ -f scripts/sync-shared.js ] && node scripts/sync-shared.js || echo "no sync script, using bundled copy"
+
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.root }}/mobile
+        run: |
+          npm install --legacy-peer-deps --no-audit --no-fund
+          npx expo install --fix || true
+
+      - name: Generate native Android project (landscape locked)
+        working-directory: ${{ steps.locate.outputs.root }}/mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Gradle settings
+        working-directory: ${{ steps.locate.outputs.root }}/mobile/android
+        run: |
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> gradle.properties
+          echo "reactNativeArchitectures=armeabi-v7a,arm64-v8a" >> gradle.properties
+          chmod +x gradlew
+
+      - name: Build release APK
+        working-directory: ${{ steps.locate.outputs.root }}/mobile/android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          APK=$(find "${{ steps.locate.outputs.root }}/mobile/android/app/build/outputs/apk/release" -name '*.apk' | head -n1)
+          test -n "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/Callbreak-Premium.apk"
+          ls -lh "$GITHUB_WORKSPACE/Callbreak-Premium.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Callbreak-Premium-apk
+          path: Callbreak-Premium.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Callbreak Premium v1.0.${{ github.run_number }}
+          body: |
+            Landscape-only Callbreak Premium for Android.
+            Download **Callbreak-Premium.apk**, allow "Install unknown apps" and install.
+          files: Callbreak-Premium.apk
